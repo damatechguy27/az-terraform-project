@@ -1,0 +1,164 @@
+# tf-test — Azure Sandbox VM
+
+A single-file-per-concern Terraform stack that stands up a **lone Ubuntu 22.04 VM** in Azure for testing and learning. Everything lives in one resource group so `terraform destroy` cleans it up in a single pass.
+
+> Sandbox only. This stack intentionally skips remote state, multi-AZ replication, and Key Vault — see "Deviations from production guidance" at the bottom.
+
+---
+
+## What gets deployed
+
+11 resources, all in one resource group:
+
+```
+                          ┌────────────────────────────────────────┐
+                          │  azurerm_resource_group.main           │
+                          │  ${project}-${environment}-rg          │
+                          │                                        │
+   Internet ── Public IP ─┤  ┌──────────────────────────────────┐  │
+   (Standard SKU)         │  │  VNet 10.10.0.0/16               │  │
+                          │  │  ┌────────────────────────────┐  │  │
+                          │  │  │  Subnet 10.10.1.0/24       │  │  │
+                          │  │  │  + NSG (SSH/22 inbound)    │  │  │
+                          │  │  │  ┌──────────────────────┐  │  │  │
+                          │  │  │  │ NIC ── Linux VM      │  │  │  │
+                          │  │  │  │ Standard_B1s, Ubuntu │  │  │  │
+                          │  │  │  │ 22.04, 30 GB SSD     │  │  │  │
+                          │  │  │  └──────────────────────┘  │  │  │
+                          │  │  └────────────────────────────┘  │  │
+                          │  └──────────────────────────────────┘  │
+                          │                                        │
+                          │  azurerm_ssh_public_key  (Azure-managed)│
+                          └────────────────────────────────────────┘
+
+                          tls_private_key ──► local_file (./terrakey.pem, 0600)
+```
+
+| # | Resource | Purpose |
+|---|----------|---------|
+| 1 | `azurerm_resource_group.main` | Container for everything below; `terraform destroy` removes it all. |
+| 2 | `azurerm_virtual_network.main` | `10.10.0.0/16` private network. |
+| 3 | `azurerm_subnet.main` | `10.10.1.0/24` subnet inside the VNet. |
+| 4 | `azurerm_network_security_group.main` | Stateful firewall; allows TCP/22 inbound. |
+| 5 | `azurerm_subnet_network_security_group_association.main` | Binds the NSG to the subnet. |
+| 6 | `azurerm_public_ip.main` | Static, Standard-SKU public IP for the VM. |
+| 7 | `azurerm_network_interface.main` | NIC with private (dynamic) + public IP. |
+| 8 | `azurerm_linux_virtual_machine.main` | Ubuntu 22.04 LTS Gen2, `Standard_B1s`, 30 GB Standard SSD, SSH-key auth only (passwords disabled). |
+| 9 | `tls_private_key.terrapriv_key` | RSA 4096 keypair generated at apply time. |
+| 10 | `local_file.terraprivkey` | Writes the private key to `./terrakey.pem` (mode `0600`). |
+| 11 | `azurerm_ssh_public_key.terrakey` | Registers the public key as a reusable Azure SSH key resource. |
+
+---
+
+## File layout
+
+| File | What's in it |
+|------|-------------|
+| `providers.tf` | Terraform `>= 1.5.0`, providers pinned: `azurerm ~> 4.0`, `tls ~> 4.0`, `local ~> 2.5`. |
+| `variables.tf` | Inputs with descriptions, types, and validation blocks. |
+| `locals.tf` | `name_prefix = "${project}-${environment}"` and the `common_tags` map applied to every resource. |
+| `main.tf` | RG, VNet, subnet, NSG + rule, NSG–subnet association, public IP, NIC, Linux VM. |
+| `keypair.tf` | TLS private key + local `.pem` file + Azure SSH public key. |
+| `outputs.tf` | `resource_group_name`, `vm_id`, `vm_public_ip`, `private_key_path`, `ssh_command`. |
+| `terraform.tfvars.example` | Template for `terraform.tfvars` (which is gitignored). |
+
+---
+
+## Naming and tagging
+
+Every resource is named `${project}-${environment}-${service}-${id}` — for example, with the defaults (`project = "tftest"`, `environment = "dev"`):
+
+- `tftest-dev-rg`
+- `tftest-dev-vnet`
+- `tftest-dev-subnet`
+- `tftest-dev-nsg`
+- `tftest-dev-pip`
+- `tftest-dev-nic-01`
+- `tftest-dev-vm-01`
+- `tftest-dev-ssh-key`
+
+Every resource that supports tags gets `local.common_tags`:
+
+| Tag | Value |
+|-----|-------|
+| `Project` | `var.project` |
+| `Environment` | `var.environment` |
+| `ManagedBy` | `terraform` |
+| `CostCenter` | `var.cost_center` |
+
+---
+
+## Inputs
+
+All inputs have defaults except where noted. See [variables.tf](variables.tf) for full validation rules.
+
+| Variable | Type | Default | Notes |
+|----------|------|---------|-------|
+| `project` | string | `"tftest"` | 1–16 chars, lowercase alphanumeric. |
+| `environment` | string | `"dev"` | One of `dev`, `stg`, `prd`. |
+| `location` | string | `"eastus"` | Any valid Azure region. |
+| `cost_center` | string | `"sandbox"` | Free-form tag value. |
+| `vm_size` | string | `"Standard_B1s"` | Burstable; bump to `Standard_B2s` for more headroom. |
+| `admin_username` | string | `"azureuser"` | Cannot be `root`/`admin`/`administrator`. |
+| `os_disk_size_gb` | number | `30` | Between 30 and 1024. |
+
+The SSH keypair is **generated by Terraform** (`keypair.tf`); no public key input is required.
+
+---
+
+## How to use
+
+### Prerequisites
+
+- Terraform `>= 1.5.0`
+- Azure CLI (`az login`) **or** a service principal exported as `ARM_*` env vars
+- `export ARM_SUBSCRIPTION_ID=<your-sub-id>`
+
+### Deploy
+
+```bash
+cp terraform.tfvars.example terraform.tfvars   # edit as needed
+terraform init
+terraform plan        # expect 11 to add, 0 to change, 0 to destroy
+terraform apply
+```
+
+### Connect
+
+```bash
+$(terraform output -raw ssh_command)
+# resolves to: ssh -i ./terrakey.pem azureuser@<public-ip>
+```
+
+### Tear down
+
+```bash
+terraform destroy
+```
+
+The single resource group means cleanup is atomic.
+
+---
+
+## Cost (us-east, on-demand, ~730 hr/mo)
+
+| Item | Approx |
+|------|--------|
+| `Standard_B1s` VM | ~$7.59/mo |
+| Standard public IP | ~$3.65/mo |
+| 30 GB Standard SSD | ~$2.40/mo |
+| **Total running 24/7** | **~$14/mo** |
+
+Stop-deallocate the VM (`az vm deallocate`) when idle to drop compute to ~$0; you'll still pay for the public IP and the disk.
+
+---
+
+## Deviations from production guidance
+
+This stack is a sandbox and consciously trades some best practices for simplicity. If you promote it, address these:
+
+- **No remote state.** State lives on the local disk. Production should use an `azurerm` backend with a Storage Account + blob lease lock.
+- **Single VM, no zone redundancy.** No availability set, no zones. A real workload would use a VM Scale Set across zones plus a load balancer.
+- **Open SSH (current state).** The NSG rule's `source_address_prefix` is currently `0.0.0.0/0`, so port 22 is reachable from the entire internet. The `allowed_ssh_cidr` variable exists in commented form — re-enable it (and swap the `source_address_prefix` back to `var.allowed_ssh_cidr`) before exposing this anywhere you care about.
+- **Private key stored locally and in state.** `terrakey.pem` lives next to the code (gitignored via `*.pem`), and the same key material is written into `terraform.tfstate`. For anything past sandbox use Azure Key Vault (`azurerm_key_vault_secret`) or have users supply their own public key.
+- **`Standard_LRS` OS disk.** Cheap but slow and not zone-redundant. Use `Premium_LRS` or `Premium_ZRS` for production.
