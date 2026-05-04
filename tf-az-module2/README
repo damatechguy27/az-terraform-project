@@ -1,0 +1,231 @@
+# tf-az-module2 — nginx VM serving content from a blob container (FUSE-mounted)
+
+Per-environment Linux VM that runs **nginx** with its document root mounted to an **Azure blob container** via **blobfuse2**. Each env has its own storage account + blob container + VM, all wired together so editing the `index.html` blob (or any file in the container) is immediately visible at `http://<vm-ip>/`.
+
+This folder builds on the `modules/` + `env/` pattern from `tf-az-module/` and adds:
+- a new **`storage`** module that creates a storage account + blob container + an `index.html` blob,
+- a **`templates/cloud-init.yaml.tpl`** that installs blobfuse2 + nginx and wires them together,
+- a `custom_data` input on the existing **`vm`** module,
+- an `allow-http` (port 80) rule alongside SSH in each env's NSG.
+
+---
+
+## What lives where
+
+```
+tf-az-module2/
+├── modules/
+│   ├── vnet/              # azurerm_virtual_network
+│   ├── subnet/            # azurerm_subnet
+│   ├── nsg/               # azurerm_network_security_group + dynamic security_rule
+│   ├── vm/                # public IP + NIC + Linux VM ─── now accepts custom_data
+│   └── storage/           # NEW: SA + container + index.html blob
+├── templates/
+│   └── cloud-init.yaml.tpl  # cloud-init: install blobfuse2 + nginx, mount, configure
+└── env/
+    ├── dev/   B1ms,  10.30.0.0/16, eastus     → SA tfmod2dev<6hex>
+    ├── stg/   B1s,   10.20.0.0/16, westus     → SA tfmod2stg<6hex>
+    └── prd/   B2s,   10.10.0.0/16, centralus  → SA tfmod2prd<6hex>
+```
+
+Each env folder contains `backend.tf`, `providers.tf`, and `main.tf`. State lives in the shared `terraformtatesa` storage account (containers `tf-az-dev|stg|prd`, blob key `az-<env>.tfstate` so it doesn't collide with `tf-az-module/`'s state in the same containers).
+
+---
+
+## Per-environment config (mapped objects)
+
+Each env's `main.tf` declares a `local.config` object — same shape, env-specific values:
+
+| Env | `vm_size` | VNet `cidr` | Derived subnet | `location` | SA name (prefix) |
+|-----|-----------|-------------|----------------|------------|------------------|
+| dev | `Standard_B1ms` (small) | `10.30.0.0/16` | `10.30.1.0/24` | `eastus` | `tfmod2dev<hex>` |
+| stg | `Standard_B1s`  (medium) | `10.20.0.0/16` | `10.20.1.0/24` | `westus` | `tfmod2stg<hex>` |
+| prd | `Standard_B2s`  (large) | `10.10.0.0/16` | `10.10.1.0/24` | `centralus` | `tfmod2prd<hex>` |
+
+The 6-hex suffix on the storage account name comes from a `random_id` resource inside the `storage` module — Azure storage account names are globally unique, so the random hex avoids collisions.
+
+---
+
+## What gets deployed per env (~15 resources)
+
+```
+                         ┌─────────────────────────────────────────────────────┐
+                         │ resource_group  ${name_prefix}-rg                   │
+                         │                                                     │
+   browser ──HTTP:80──►  │  ┌────────────────┐    ┌──────────────────────┐    │
+                         │  │  Linux VM      │    │  storage account     │    │
+                         │  │  ─ nginx       │    │  tfmod2<env><6hex>   │    │
+                         │  │  ─ blobfuse2 ──┼───►│  ─ container "web"   │    │
+                         │  │     /mnt/      │    │     ─ index.html     │    │
+                         │  │     blobfuse   │    │       (managed by    │    │
+                         │  │  ─ NIC + pub IP│    │        terraform)    │    │
+                         │  └────────────────┘    └──────────────────────┘    │
+                         │       │                                             │
+                         │   subnet ◄──── NSG (22 + 80)                        │
+                         │       │                                             │
+                         │   VNet (local.config.cidr)                          │
+                         └─────────────────────────────────────────────────────┘
+```
+
+| # | Resource | Created by |
+|---|----------|------------|
+| 1 | `azurerm_resource_group.main` | env's `main.tf` |
+| 2 | `tls_private_key.ssh` | env's `main.tf` |
+| 3 | `local_file.ssh_private_key` (`.pem` on disk, mode 0600) | env's `main.tf` |
+| 4 | `random_id.sa_suffix` | `module.storage` |
+| 5 | `azurerm_storage_account.this` | `module.storage` |
+| 6 | `azurerm_storage_container.this` (private) | `module.storage` |
+| 7 | `azurerm_storage_blob.index` (`index.html`) | `module.storage` |
+| 8 | `azurerm_virtual_network.this` | `module.vnet` |
+| 9 | `azurerm_subnet.this` | `module.subnet` |
+| 10 | `azurerm_network_security_group.this` (rules: SSH/22, HTTP/80) | `module.nsg` |
+| 11 | `azurerm_subnet_network_security_group_association.main` | env's `main.tf` |
+| 12 | `azurerm_public_ip.this[0]` | `module.vm` |
+| 13 | `azurerm_network_interface.this` | `module.vm` |
+| 14 | `azurerm_linux_virtual_machine.this` (Ubuntu 22.04, custom_data = cloud-init) | `module.vm` |
+
+---
+
+## How the modules wire together
+
+[env/<env>/main.tf](env/dev/main.tf) is the orchestrator. The data flow:
+
+```
+local.index_html ──► module.storage.index_html_content
+                     │
+                     ├─► storage_account_name ──┐
+                     ├─► primary_access_key  ───┼─► templatefile(cloud-init.yaml.tpl)
+                     └─► container_name      ──┘     │
+                                                     ▼
+                                                base64encode(...) ──► module.vm.custom_data
+```
+
+The render at the env level looks like this (`env/dev/main.tf`):
+
+```hcl
+custom_data = base64encode(templatefile("${path.module}/../../templates/cloud-init.yaml.tpl", {
+  storage_account_name = module.storage.storage_account_name
+  storage_account_key  = module.storage.primary_access_key
+  container_name       = module.storage.container_name
+}))
+```
+
+That cloud-init payload is what the VM executes on its first boot.
+
+---
+
+## What cloud-init does on first boot
+
+[templates/cloud-init.yaml.tpl](templates/cloud-init.yaml.tpl) runs in two phases:
+
+**`write_files`** (drops three config files into place before any commands run):
+- `/etc/blobfuse2/config.yaml` — SA name + key + container, file-cache settings, `allow-other: true`.
+- `/etc/systemd/system/blobfuse.service` — systemd unit that calls `blobfuse2 mount /mnt/blobfuse --config-file=/etc/blobfuse2/config.yaml -o allow_other`, with `Restart=on-failure`.
+- `/etc/nginx/sites-available/default` — `root /mnt/blobfuse;` `index index.html;`.
+
+**`runcmd`** (executed in order):
+1. Add the Microsoft apt repo (`packages-microsoft-prod.deb`).
+2. `apt-get install` of `blobfuse2`, `fuse3`, `nginx`. Two crucial flags:
+   - `DEBIAN_FRONTEND=noninteractive` (suppresses debconf prompts)
+   - `-o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef"` (suppresses **conffile** prompts so dpkg keeps our pre-written `/etc/nginx/sites-available/default` instead of asking the user).
+3. `mkdir /mnt/blobfuse /tmp/blobfuse-cache`
+4. `systemctl daemon-reload`
+5. `systemctl enable --now blobfuse.service` (mounts the container)
+6. `sleep 10` (give blobfuse a moment to mount)
+7. `systemctl restart nginx` (now serves files from `/mnt/blobfuse`)
+
+End result: hitting `http://<vm-public-ip>/` returns the `index.html` blob — but the actual file lives in the storage account, not on the VM.
+
+> **Why those dpkg flags matter.** Without them, the install of nginx-common hits a conffile conflict on `/etc/nginx/sites-available/default` (we pre-wrote it via `write_files`). Default `noninteractive` does **not** suppress conffile prompts; dpkg ends up reading EOF from stdin and aborts, leaving nginx half-installed and `sites-enabled/default` never created — nginx starts but listens on no ports. Symptom: `curl http://<ip>` → `Connection refused`. The `--force-confold --force-confdef` pair tells dpkg to keep our file silently, which is exactly what we want.
+
+---
+
+## How to deploy
+
+### Prerequisites (once)
+
+```bash
+az login
+export ARM_SUBSCRIPTION_ID=<your-sub-id>
+```
+
+The signed-in identity needs:
+- **Contributor** on the subscription (or RG once it exists) — for VM, networking, storage account, etc.
+- **Storage Blob Data Contributor** on `terraformtatesa` — for the remote backend's state read/write.
+
+### Apply an environment
+
+```bash
+cd env/dev          # or stg / prd
+terraform init      # configures the azurerm backend → terraformtatesa/tf-az-dev
+terraform plan      # ~15 to add
+terraform apply
+```
+
+### Verify
+
+```bash
+terraform output -raw web_url        # http://<ip>/
+curl $(terraform output -raw web_url) # should return the env-specific HTML
+$(terraform output -raw ssh_command)  # SSH in for debugging
+```
+
+First boot takes ~90–120 s (apt install + FUSE mount). If `curl` returns `Connection refused`, wait, then retry.
+
+### Tear down
+
+```bash
+terraform destroy
+```
+
+Single resource group → atomic cleanup (RG, SA, blob, VNet, NSG, VM all go in one operation).
+
+---
+
+## Diagnosing problems on the VM
+
+If something doesn't come up cleanly, SSH in and check in this order:
+
+```bash
+sudo cloud-init status --long              # done | running | error
+sudo tail -100 /var/log/cloud-init-output.log
+mount | grep blobfuse                      # should show /mnt/blobfuse
+ls -la /mnt/blobfuse                       # should show index.html
+sudo journalctl -u blobfuse -n 50          # mount/auth errors live here
+ss -tlnp | grep :80                        # should show nginx
+ls -la /etc/nginx/sites-enabled/           # should contain `default` symlink
+sudo nginx -t                              # config syntax check
+```
+
+Common failure → cause map:
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `curl` → `Connection refused`; nginx is "running" but `ss -tlnp | grep :80` is empty | Conffile prompt on `nginx-common` aborted the install (pre-`--force-confold` deploys) | `sudo apt-get install -y -o Dpkg::Options::="--force-confold" nginx` then `sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default && sudo systemctl restart nginx` |
+| `mount` shows nothing | blobfuse failed (auth, network, container missing) | `journalctl -u blobfuse` — look for 403/404 |
+| `ls /mnt/blobfuse` works as root, nginx returns 403 | FUSE `allow_other` not letting `www-data` read | `sudo systemctl restart blobfuse` then `sudo systemctl restart nginx`. If still 403, uncomment `user_allow_other` in `/etc/fuse.conf` |
+| Page shows but is stale after editing the blob | blobfuse `file_cache.timeout-sec` (default 120 s) | Wait, or `sudo systemctl restart blobfuse` |
+
+---
+
+## Cost (us-east on-demand, ~730 hr/mo, per env running 24/7)
+
+| Env | VM | Public IP | 30 GB SSD | SA (LRS, ~empty) | Total |
+|-----|----|-----------|-----------|------------------|-------|
+| dev (`B1ms`) | ~$15.18 | ~$3.65 | ~$2.40 | ~$0.05 | **~$21/mo** |
+| stg (`B1s`)  | ~$7.59  | ~$3.65 | ~$2.40 | ~$0.05 | **~$14/mo** |
+| prd (`B2s`)  | ~$30.37 | ~$3.65 | ~$2.40 | ~$0.05 | **~$36/mo** |
+
+Stop-deallocate (`az vm deallocate`) when idle to drop compute to ~$0; you'll still pay for the public IP, the disk, and the few cents of blob storage.
+
+---
+
+## Deviations from production guidance
+
+- **Storage account key on the VM and in state.** The SA primary key is templated into cloud-init and stored in `/var/lib/cloud/instance/user-data.txt` on the VM, plus `terraform.tfstate` (the `module.storage.primary_access_key` output is `sensitive = true` but still in state). Sandbox-acceptable; for prod, swap to a **VM system-assigned Managed Identity** + **Storage Blob Data Reader** RBAC role on the SA, and switch blobfuse's `mode: key` to `mode: msi` in `cloud-init.yaml.tpl`. No secret material then leaves Azure.
+- **Single VM per env, no scale set.** No availability set, no zones, no load balancer. Real workloads should use a VM Scale Set or AKS behind a load balancer or Application Gateway.
+- **Open SSH and HTTP (`0.0.0.0/0`).** Both NSG rules allow inbound from anywhere. The `nsg` module supports tighter scoping — pass a `source_address_prefix` of your `/32` for SSH, and put HTTPS behind a CDN/WAF for HTTP exposure.
+- **No HTTPS.** nginx serves plaintext over port 80. For real use, terminate TLS via Azure Application Gateway, Front Door, or an nginx reverse-proxy config with Let's Encrypt.
+- **`Standard_LRS` everything.** OS disk and storage account both single-zone. `Premium_LRS` (or `_ZRS`) for prod via the `os_disk_storage_account_type` and `replication_type` inputs on the `vm` and `storage` modules respectively.
+- **Generated SSH key on disk + in state.** `tls_private_key` writes the PEM to `./${name_prefix}-terrakey.pem` (gitignored via `*.pem`) and the private key is also in `terraform.tfstate`. For prod, prefer Azure Key Vault or supply your own public key as a variable.
+- **Blob container is private.** Reachable only via the SA key (or an authorized identity), not by anonymous HTTP — that's why we mount it via blobfuse on the VM rather than letting the browser hit the blob endpoint directly.
