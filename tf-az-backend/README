@@ -1,0 +1,166 @@
+# tf-az-backend — Per-environment Terraform remote state on Azure
+
+This folder is the **scaffolding for environment-isolated remote state**. It does not deploy any workloads. Instead, each `env/<environment>/` folder is a Terraform root config that's wired up to store its state in a dedicated container inside the shared Azure Storage Account `terraformtatesa`. Drop workload `.tf` files into one of these folders and the state for that environment lives in its own container, separate from the others.
+
+---
+
+## What lives where
+
+```
+tf-az-backend/
+└── env/
+    ├── dev/
+    │   ├── backend.tf      # azurerm backend → terraformtatesa / tf-az-dev
+    │   └── providers.tf
+    ├── stg/
+    │   ├── backend.tf      # azurerm backend → terraformtatesa / tf-az-stg
+    │   └── providers.tf
+    └── prd/
+        ├── backend.tf      # azurerm backend → terraformtatesa / tf-az-prd
+        └── providers.tf
+```
+
+Each env folder contains exactly two files today; both are intentionally minimal so future workload code (`main.tf`, `variables.tf`, etc.) can be added next to them without conflict.
+
+---
+
+## What's hand-managed (outside Terraform)
+
+The backend infrastructure itself is **not** managed by this folder. It was created by hand once and lives outside Terraform's blast radius — that's the whole point of this layout.
+
+| Resource | Where | Purpose |
+|----------|-------|---------|
+| Resource group `aztools` | Azure | Holds the storage account. |
+| Storage account `terraformtatesa` | `aztools` | Single shared SA for all env state files. |
+| Container `tf-az-dev` | `terraformtatesa` | Holds `terraform.tfstate` for the dev environment. |
+| Container `tf-az-stg` | `terraformtatesa` | Holds `terraform.tfstate` for the stg environment. |
+| Container `tf-az-prd` | `terraformtatesa` | Holds `terraform.tfstate` for the prd environment. |
+
+**Why hand-managed?** If Terraform also created the containers it stores its own state in, two things break: (1) the very first `terraform init` fails because the backend points at a container that doesn't exist yet, forcing a comment-out → apply → uncomment → `init -migrate-state` dance per environment, and (2) `terraform destroy` from inside an env folder tries to delete the container holding its own state mid-operation. Splitting "platform infra" (the SA + containers) from "app infra" (anything you add to an env folder) avoids both problems.
+
+If you ever need to recreate the containers from scratch:
+
+```bash
+az storage container create --name tf-az-dev --account-name terraformtatesa --auth-mode login
+az storage container create --name tf-az-stg --account-name terraformtatesa --auth-mode login
+az storage container create --name tf-az-prd --account-name terraformtatesa --auth-mode login
+```
+
+---
+
+## How the backend is configured
+
+Every env folder has a `backend.tf` with the same shape; only the `container_name` line changes between them. Here's `env/dev/backend.tf`:
+
+```hcl
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "aztools"
+    storage_account_name = "terraformtatesa"
+    container_name       = "tf-az-dev"
+    key                  = "terraform.tfstate"
+  }
+}
+```
+
+| Field | Value | Notes |
+|-------|-------|-------|
+| `resource_group_name` | `aztools` | RG that contains the SA. |
+| `storage_account_name` | `terraformtatesa` | Globally unique. Hand-created. |
+| `container_name` | `tf-az-{env}` | **The only thing that differs per env.** Provides state isolation. |
+| `key` | `terraform.tfstate` | Blob name within the container. Same value across envs because each env has its own container. |
+
+`stg/backend.tf` and `prd/backend.tf` are identical except `container_name` is `tf-az-stg` and `tf-az-prd` respectively.
+
+The Terraform documentation for this block is at [hashicorp/terraform — Azure backend](https://developer.hashicorp.com/terraform/language/backend/azurerm). Backend blocks **cannot** use variables — that's why the values are hardcoded literally and why each env has its own `backend.tf`.
+
+---
+
+## Authenticating
+
+Backend blocks don't carry credentials; Terraform picks them up from the environment. Two common paths:
+
+**Azure CLI identity (recommended for local dev):**
+```bash
+az login
+export ARM_SUBSCRIPTION_ID=<your-sub-id>
+```
+The identity logged in needs **Storage Blob Data Contributor** on `terraformtatesa` so it can read/write state blobs. Reader on the SA is not enough.
+
+**Storage account access key (fallback):**
+```bash
+export ARM_ACCESS_KEY="$(az storage account keys list \
+  --account-name terraformtatesa \
+  --query '[0].value' -o tsv)"
+```
+This works without the data-plane RBAC but exposes a long-lived shared key — fine for sandbox, avoid for prod.
+
+---
+
+## How to use it
+
+### Initialize an environment
+
+```bash
+cd env/dev          # or stg, or prd
+terraform init      # contacts terraformtatesa/tf-az-dev, sets up the backend
+```
+
+The first `init` writes a small `.terraform/terraform.tfstate` lockfile reference locally and creates an empty `terraform.tfstate` blob in the container if one doesn't exist.
+
+### Plan / apply (with no resources yet)
+
+```bash
+terraform plan      # "No changes. Your infrastructure matches the configuration."
+```
+
+This is expected — `env/<env>/` only has the backend wiring, no resources. As soon as you add `main.tf` (or any other `.tf` files defining resources) next to `backend.tf` and `providers.tf`, `terraform plan` and `apply` will work normally and the resulting state will land in the right container.
+
+### Adding a workload to an environment
+
+Example — to host the `tf-vm-maps` Linux VM stack with its `dev` state stored remotely:
+
+```bash
+cp ../../tf-vm-maps/main.tf      env/dev/
+cp ../../tf-vm-maps/variables.tf env/dev/
+cp ../../tf-vm-maps/locals.tf    env/dev/
+cp ../../tf-vm-maps/keypair.tf   env/dev/
+cp ../../tf-vm-maps/outputs.tf   env/dev/
+cd env/dev
+terraform init                   # picks up the new resources, backend already configured
+terraform apply -var environment=dev
+```
+
+After apply, `terraform.tfstate` lives in `terraformtatesa/tf-az-dev/terraform.tfstate`.
+
+---
+
+## Switching between environments
+
+There is no implicit "current environment" — `cd` into the folder you want to operate on. Each folder is independent:
+
+```bash
+cd env/dev && terraform plan     # touches only tf-az-dev
+cd ../stg  && terraform plan     # touches only tf-az-stg
+cd ../prd  && terraform plan     # touches only tf-az-prd
+```
+
+This is the deliberate alternative to Terraform workspaces: explicit folders make it obvious which environment you're acting on, and there's no `terraform workspace select` step to forget.
+
+---
+
+## What this layout gives you
+
+- **State isolation per environment.** A bad `apply` in dev cannot corrupt stg or prd state.
+- **Always-active backends.** No first-run comment-out dance.
+- **Safe `terraform destroy`.** State is in a container Terraform doesn't manage, so destroy never operates on its own footing.
+- **Clean blast-radius separation.** Permissions on `terraformtatesa` are managed once at the SA level, independent of any env's Terraform code.
+
+---
+
+## Deviations from production guidance
+
+- **Single shared storage account across all envs.** Production typically isolates state per env in its own SA (or at least per-env access policies) so a compromised dev credential can't read prod state. Here all three containers live in one SA — fine for sandbox; consider splitting if you go past that.
+- **No state locking is configured by name.** The azurerm backend uses **blob leases** for locking automatically, so concurrent `apply`s are safe — but be aware there's no separate Cosmos DB / DynamoDB-style lock table; the lock lives on the state blob itself.
+- **No state versioning enabled by default.** Verify in the portal that the SA has **Blob versioning** + **Soft delete (7+ days)** turned on — otherwise an accidental `terraform state rm` followed by an apply can lose history. Storage account → Data protection.
+- **Long-lived storage account keys** are still enabled on the SA. Prefer Entra ID auth (`--auth-mode login` on `az` commands, AAD-based RBAC for Terraform) and disable shared keys via `allow_shared_key_access = false` on the SA when ready.
