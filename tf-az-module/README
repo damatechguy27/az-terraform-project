@@ -1,0 +1,262 @@
+# tf-az-module — Modular per-environment Azure VM stack
+
+A hybrid of two patterns: **reusable Terraform modules** (under `modules/`) consumed by **per-environment root configs** (under `env/dev|stg|prd/`). Each env folder is a complete, self-contained Terraform stack that hardcodes its own size/CIDR/region into a `local.config` object and calls the same four modules. State lands in the shared remote backend created by `../tf-az-backend/`.
+
+---
+
+## What lives where
+
+```
+tf-az-module/
+├── modules/
+│   ├── vnet/        # azurerm_virtual_network
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── subnet/      # azurerm_subnet
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   ├── nsg/         # azurerm_network_security_group + dynamic security_rule
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   └── outputs.tf
+│   └── vm/          # public IP + NIC + Linux VM bundled together
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf
+└── env/
+    ├── dev/
+    │   ├── backend.tf      # azurerm → terraformtatesa / tf-az-dev
+    │   ├── providers.tf    # azurerm + tls + local
+    │   └── main.tf         # local.config + RG + keypair + 4 module calls + outputs
+    ├── stg/                # same shape, different config
+    └── prd/                # same shape, different config
+```
+
+`modules/` are pure libraries — no resources are created by `terraform apply` on them directly. The work happens in each `env/<env>/` folder.
+
+---
+
+## The four modules
+
+| Module | Wraps | Purpose |
+|--------|-------|---------|
+| **vnet** | `azurerm_virtual_network` | Creates a VNet with the given address space. Validates CIDRs at input time. |
+| **subnet** | `azurerm_subnet` | Creates a single subnet in an existing VNet. Validates CIDRs. |
+| **nsg** | `azurerm_network_security_group` | Creates an NSG with rules supplied as a `map(object(...))`. Uses `dynamic "security_rule"` so rule count is open-ended. Validates direction / access / protocol / priority. |
+| **vm** | `azurerm_public_ip`, `azurerm_network_interface`, `azurerm_linux_virtual_machine` | Bundles the three resources Azure requires for a basic Linux VM. Toggleable public IP via `create_public_ip = bool`. Validates VM SKU, admin username, OS disk size, OS disk SKU, and SSH public key format. |
+
+The modules are deliberately thin — they encapsulate "the right way to spell this resource" (validation, sensible defaults like Standard SKU public IP, password auth disabled on VMs) without baking in opinionated structure. Use them à la carte.
+
+### Module input/output sketch
+
+```
+vnet      ─► id, name, address_space
+            ▲
+            │ name
+            │
+subnet ────►│  id, name, address_prefixes
+            │
+            │ subnet_id
+            ▼
+vm        ─► id, name, private_ip_address, public_ip_address
+
+nsg       ─► id, name
+   ▲
+   │ id  (security_rules map keyed by rule name)
+   │
+root config attaches NSG to subnet via azurerm_subnet_network_security_group_association
+```
+
+The `azurerm_subnet_network_security_group_association` resource lives in each env's `main.tf` (not in a module) because it crosses the subnet/nsg module boundary.
+
+---
+
+## Per-environment config
+
+Each env folder declares a `local.config` object — same shape, different values:
+
+| Env | `vm_size` | VNet `cidr` | Derived subnet | `location` |
+|-----|-----------|-------------|----------------|------------|
+| dev | `Standard_B1ms` (small) | `10.30.0.0/16` | `cidrsubnet(cidr, 8, 1)` → `10.30.1.0/24` | `eastus` |
+| stg | `Standard_B1s`  (medium) | `10.20.0.0/16` | `cidrsubnet(cidr, 8, 1)` → `10.20.1.0/24` | `westus` |
+| prd | `Standard_B2s`  (large) | `10.10.0.0/16` | `cidrsubnet(cidr, 8, 1)` → `10.10.1.0/24` | `centralus` |
+
+The three CIDRs are non-overlapping `/16`s — peering-safe if you ever need it. Subnet is a `/24` carved out of each VNet's `/16`.
+
+Same naming scheme as the other folders: `${project}-${environment}-<service>` → e.g. `tfmod-dev-rg`, `tfmod-dev-vnet`, `tfmod-dev-vm-01`. Standard CLAUDE.md tags (`Project`, `Environment`, `ManagedBy`, `CostCenter`) on every taggable resource.
+
+---
+
+## What gets deployed per env (apply 11 resources)
+
+```
+                          ┌───────────────────────────────────────────┐
+                          │  azurerm_resource_group.main              │
+                          │  ${name_prefix}-rg in local.config.location│
+                          │                                           │
+   Internet ── Public IP ─┤  ┌─────────────────────────────────────┐  │
+   (Standard SKU,         │  │  module.vnet                        │  │
+    via module.vm)        │  │  address_space = [local.config.cidr]│  │
+                          │  │  ┌───────────────────────────────┐  │  │
+                          │  │  │  module.subnet                │  │  │
+                          │  │  │  /24 derived via cidrsubnet   │  │  │
+                          │  │  │  ── associated with module.nsg│  │  │
+                          │  │  │  ┌─────────────────────────┐  │  │  │
+                          │  │  │  │ module.vm               │  │  │  │
+                          │  │  │  │ size = config.vm_size   │  │  │  │
+                          │  │  │  │ Ubuntu 22.04, 30 GB SSD │  │  │  │
+                          │  │  │  └─────────────────────────┘  │  │  │
+                          │  │  └───────────────────────────────┘  │  │
+                          │  └─────────────────────────────────────┘  │
+                          └───────────────────────────────────────────┘
+
+                          tls_private_key ──► local_file
+                                              ${name_prefix}-terrakey.pem (0600)
+```
+
+| # | Resource | Created by |
+|---|----------|------------|
+| 1 | `azurerm_resource_group.main` | env's `main.tf` |
+| 2 | `tls_private_key.ssh` | env's `main.tf` |
+| 3 | `local_file.ssh_private_key` | env's `main.tf` |
+| 4 | `azurerm_virtual_network.this` | `module.vnet` |
+| 5 | `azurerm_subnet.this` | `module.subnet` |
+| 6 | `azurerm_network_security_group.this` | `module.nsg` |
+| 7 | `azurerm_subnet_network_security_group_association.main` | env's `main.tf` |
+| 8 | `azurerm_public_ip.this[0]` | `module.vm` |
+| 9 | `azurerm_network_interface.this` | `module.vm` |
+| 10 | `azurerm_linux_virtual_machine.this` | `module.vm` |
+
+(Plus the `tls_private_key` and `local_file` — 11 total under `terraform plan`.)
+
+---
+
+## How to deploy each environment
+
+### Prerequisites (once)
+
+```bash
+az login
+export ARM_SUBSCRIPTION_ID=<your-sub-id>
+```
+
+The signed-in identity needs:
+- **Contributor** on the subscription (or the resource group, once it exists) — to create the VM, networking, etc.
+- **Storage Blob Data Contributor** on the SA `terraformtatesa` — for the remote backend to read/write state. Reader on the SA is not enough.
+
+### Apply an environment
+
+```bash
+cd env/dev      # or stg, or prd
+terraform init  # initializes the azurerm backend → terraformtatesa/tf-az-dev
+terraform plan  # expect 11 to add
+terraform apply
+```
+
+Wait ~2–3 min for the VM to come up.
+
+### Connect
+
+```bash
+$(terraform output -raw ssh_command)
+# resolves to:  ssh -i ./tfmod-dev-terrakey.pem azureuser@<public-ip>
+```
+
+The private key file is gitignored via `*.pem` (set up once at the project root).
+
+### Tear down
+
+```bash
+terraform destroy
+```
+
+Single resource group, atomic cleanup.
+
+---
+
+## Switching environments
+
+No workspace gymnastics — `cd` to the env you want. Each folder has its own state file in its own container:
+
+```bash
+cd env/dev && terraform plan    # touches only tf-az-dev state
+cd ../stg  && terraform plan    # touches only tf-az-stg state
+cd ../prd  && terraform plan    # touches only tf-az-prd state
+```
+
+---
+
+## How the backend is wired
+
+Each env folder uses the remote backend that `../tf-az-backend/` documents. Identical layout, only `container_name` differs:
+
+```hcl
+# env/dev/backend.tf
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "aztools"
+    storage_account_name = "terraformtatesa"
+    container_name       = "tf-az-dev"      # tf-az-stg, tf-az-prd in the others
+    key                  = "terraform.tfstate"
+  }
+}
+```
+
+The SA `terraformtatesa` and the three containers are **hand-created** outside Terraform — see [../tf-az-backend/README](../tf-az-backend/README) for why.
+
+---
+
+## Adding a new environment
+
+Three steps:
+
+1. **Create the state container** (manual, one-time):
+   ```bash
+   az storage container create --name tf-az-qa --account-name terraformtatesa --auth-mode login
+   ```
+2. **Copy an existing env folder** as a starting point:
+   ```bash
+   cp -r env/dev env/qa
+   ```
+3. **Edit two files in `env/qa/`**:
+   - `backend.tf` — change `container_name` to `tf-az-qa`.
+   - `main.tf` — set `local.environment = "qa"` and edit the `local.config` block (vm_size, cidr, location).
+
+Then `cd env/qa && terraform init && terraform apply`.
+
+---
+
+## Cost (us-east on-demand, ~730 hr/mo, per env running 24/7)
+
+| Env | VM size | VM | Public IP | 30 GB SSD | Total |
+|-----|---------|----|-----------|-----------|-------|
+| dev | `Standard_B1ms` | ~$15.18 | ~$3.65 | ~$2.40 | **~$21/mo** |
+| stg | `Standard_B1s`  | ~$7.59  | ~$3.65 | ~$2.40 | **~$14/mo** |
+| prd | `Standard_B2s`  | ~$30.37 | ~$3.65 | ~$2.40 | **~$36/mo** |
+
+Stop-deallocate (`az vm deallocate`) when idle to drop compute to ~$0; you'll still pay for the public IP and disk.
+
+---
+
+## Why this layout (vs. tf-vm-maps)
+
+`tf-vm-maps/` uses **one root config + an `env_config` map** selected via `-var environment=`. That's clean for "select an env at apply time" but has two drawbacks: (1) one local state file shared across envs (workspaces needed for parallel envs), and (2) inline resource code in `main.tf` rather than reusable modules.
+
+This folder uses **per-env folders + a shared module library**. You get:
+
+- **Reusable modules.** `modules/vnet`, `modules/subnet`, `modules/nsg`, `modules/vm` can be consumed by any future stack — not just this one.
+- **Real per-env state isolation.** Each env writes to its own container; no `-var` or workspace mistake can cross-contaminate.
+- **Always-active backends.** No bootstrap dance.
+- **Slightly more boilerplate.** Three nearly-identical `main.tf` files. The duplication is intentional and small (one `local.config` block differs, plus the env name).
+
+---
+
+## Deviations from production guidance
+
+- **Open SSH (`0.0.0.0/0`).** Each env's `nsg` rule allows inbound TCP/22 from anywhere. The module supports tighter scoping — pass a different `source_address_prefix` (e.g. your `/32`) in the `security_rules` map. Currently wide-open for sandbox convenience.
+- **Single VM per env.** No availability set, no zones, no scale set, no load balancer. Production should use a VM Scale Set across zones behind a load balancer.
+- **Generated SSH key on disk + in state.** `tls_private_key` writes the PEM to `./${name_prefix}-terrakey.pem` (mode 0600, gitignored via `*.pem`), and the same key material is also stored in `terraform.tfstate` inside `terraformtatesa/tf-az-<env>`. For prod, prefer Azure Key Vault (`azurerm_key_vault_secret`) or supply your own public key as a variable.
+- **`Standard_LRS` OS disk.** Cheap, single-zone. Use `Premium_LRS` or `Premium_ZRS` for production via the `os_disk_storage_account_type` input on the `vm` module.
+- **No NSG rules denying egress.** Default azurerm NSG allows all outbound. Production should explicitly deny what isn't needed.
