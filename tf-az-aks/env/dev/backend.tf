@@ -3,6 +3,6 @@ terraform {
     resource_group_name  = "aztools"
     storage_account_name = "terraformtatesa"
     container_name       = "tf-az-dev"
-    key                  = "az-dev.tfstate"
+    key                  = "aks-dev.tfstate"
   }
 }

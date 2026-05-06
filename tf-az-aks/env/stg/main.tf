@@ -1,11 +1,11 @@
 locals {
   environment = "stg"
-  project     = "tfmod"
+  project     = "tfaks"
 
   config = {
-    vm_size  = "Standard_B1s" # medium
-    cidr     = "10.20.0.0/16"
-    location = "westus"
+    node_count   = 2
+    node_vm_size = "Standard_B2s"
+    location     = "westus"
   }
 
   name_prefix = "${local.project}-${local.environment}"
@@ -24,86 +24,54 @@ resource "azurerm_resource_group" "main" {
   tags     = local.common_tags
 }
 
-resource "tls_private_key" "ssh" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
+module "aks" {
+  source = "../../modules/aks"
 
-resource "local_file" "ssh_private_key" {
-  filename        = "${path.module}/${local.name_prefix}-terrakey.pem"
-  file_permission = "0600"
-  content         = tls_private_key.ssh.private_key_pem
-}
-
-module "vnet" {
-  source = "../../modules/vnet"
-
-  name                = "${local.name_prefix}-vnet"
+  name                = "${local.name_prefix}-cluster"
   location            = azurerm_resource_group.main.location
   resource_group_name = azurerm_resource_group.main.name
-  address_space       = [local.config.cidr]
+  dns_prefix          = "${local.project}${local.environment}"
+  node_count          = local.config.node_count
+  node_vm_size        = local.config.node_vm_size
   tags                = local.common_tags
 }
 
-module "subnet" {
-  source = "../../modules/subnet"
+resource "helm_release" "nginx" {
+  name      = "nginx"
+  chart     = "oci://registry-1.docker.io/bitnamicharts/nginx"
+  namespace = "default"
 
-  name                 = "${local.name_prefix}-subnet"
-  resource_group_name  = azurerm_resource_group.main.name
-  virtual_network_name = module.vnet.name
-  address_prefixes     = [cidrsubnet(local.config.cidr, 8, 1)]
-}
+  # Pin a known version in real use:
+  # version = "18.3.6"
 
-module "nsg" {
-  source = "../../modules/nsg"
+  values = [
+    yamlencode({
+      service = {
+        type = "LoadBalancer"
+      }
+    })
+  ]
 
-  name                = "${local.name_prefix}-nsg"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-  tags                = local.common_tags
-
-  security_rules = {
-    allow-ssh = {
-      priority                   = 100
-      direction                  = "Inbound"
-      access                     = "Allow"
-      protocol                   = "Tcp"
-      source_port_range          = "*"
-      destination_port_range     = "22"
-      source_address_prefix      = "0.0.0.0/0"
-      destination_address_prefix = "*"
-    }
-  }
-}
-
-resource "azurerm_subnet_network_security_group_association" "main" {
-  subnet_id                 = module.subnet.id
-  network_security_group_id = module.nsg.id
-}
-
-module "vm" {
-  source = "../../modules/vm"
-
-  name                 = "${local.name_prefix}-vm-01"
-  location             = azurerm_resource_group.main.location
-  resource_group_name  = azurerm_resource_group.main.name
-  subnet_id            = module.subnet.id
-  vm_size              = local.config.vm_size
-  admin_ssh_public_key = tls_private_key.ssh.public_key_openssh
-  tags                 = local.common_tags
+  wait    = true
+  timeout = 600
 }
 
 output "resource_group_name" {
-  description = "Resource group containing this environment's resources."
+  description = "Resource group containing the AKS cluster."
   value       = azurerm_resource_group.main.name
 }
 
-output "vm_public_ip" {
-  description = "Public IP of the VM."
-  value       = module.vm.public_ip_address
+output "cluster_name" {
+  description = "Name of the AKS cluster."
+  value       = module.aks.name
 }
 
-output "ssh_command" {
-  description = "Ready-to-run SSH command using the generated private key."
-  value       = "ssh -i ${local_file.ssh_private_key.filename} azureuser@${module.vm.public_ip_address}"
+output "get_credentials_command" {
+  description = "Run this to point kubectl at the new cluster."
+  value       = "az aks get-credentials --resource-group ${azurerm_resource_group.main.name} --name ${module.aks.name} --overwrite-existing"
+}
+
+output "get_nginx_ip_command" {
+  description = "Run this after apply to fetch the nginx LoadBalancer's external IP."
+  value       = "kubectl get svc -n ${helm_release.nginx.namespace} ${helm_release.nginx.name} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'"
 }

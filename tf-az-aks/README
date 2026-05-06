@@ -1,1 +1,226 @@
-Coming Soon 
+# tf-az-aks — AKS cluster + nginx via Helm, exposed by a public Load Balancer
+
+Per-environment Azure Kubernetes Service cluster (single default node pool, system-assigned managed identity) with the **Bitnami nginx Helm chart** deployed on top. The chart's Service is `type: LoadBalancer`, so AKS asks Azure for a Standard public IP + Load Balancer and binds them to the nginx pod. Hit the LB's external IP and you get the nginx welcome page.
+
+---
+
+## What lives where
+
+```
+tf-az-aks/
+├── modules/
+│   └── aks/                       # azurerm_kubernetes_cluster + default node pool
+│       ├── main.tf
+│       ├── variables.tf
+│       └── outputs.tf             # exports host + certs for the helm provider
+└── env/
+    ├── dev/
+    │   ├── backend.tf             # azurerm → terraformtatesa / tf-az-dev   (key=aks-dev.tfstate)
+    │   ├── providers.tf           # azurerm + helm
+    │   └── main.tf                # RG + module.aks + helm_release "nginx"
+    ├── stg/                       # same shape, 2-node cluster in westus
+    └── prd/                       # same shape, 3-node cluster in centralus
+```
+
+State for each env lives in the shared `terraformtatesa` storage account in `aztools` RG (the same containers as `tf-az-module/` and `tf-az-module2/`, but with `aks-<env>.tfstate` blob keys so they don't collide).
+
+---
+
+## Per-environment config (mapped objects)
+
+Each env's `main.tf` declares a `local.config` object:
+
+| Env | `node_count` | `node_vm_size` | `location` |
+|-----|--------------|-----------------|------------|
+| dev | 1 | `Standard_B2s` | `eastus` |
+| stg | 2 | `Standard_B2s` | `westus` |
+| prd | 3 | `Standard_B2s` | `centralus` |
+
+`Standard_B2s` (2 vCPU / 4 GB) is the cheapest size that meets AKS's minimum node spec. Bumping `prd` to a bigger SKU (e.g. `Standard_D2s_v3`) is a one-line change in `local.config`.
+
+Naming follows the project convention `${project}-${environment}-<service>`: cluster `tfaks-dev-cluster`, RG `tfaks-dev-rg`. DNS prefix `tfaks${env}` (no hyphen — Azure rejects hyphens at the start/end of dns_prefix).
+
+---
+
+## What gets deployed per env (3 resources)
+
+```
+                                ┌───────────────────────────────────────────────┐
+                                │  resource_group  ${name_prefix}-rg            │
+                                │                                               │
+                                │  ┌─────────────────────────────────────────┐  │
+                                │  │ azurerm_kubernetes_cluster               │  │
+                                │  │   ─ system-assigned managed identity     │  │
+                                │  │   ─ default node pool                    │  │
+                                │  │       node_count × node_vm_size          │  │
+                                │  │                                          │  │
+                                │  │   helm_release "nginx" (bitnami OCI)     │  │
+                                │  │     └─ kind: Service type=LoadBalancer ──┼──┐
+                                │  └─────────────────────────────────────────┘  │ │
+                                │                                               │ │
+                                │   Azure-provisioned Standard public IP + LB ◄─┼─┘
+                                └───────────────────────────────────────────────┘
+
+      browser ──HTTP:80──► <LB public IP> ──► (port 80 → 8080 on pod) ──► nginx pod
+```
+
+| # | Resource | Created by |
+|---|----------|------------|
+| 1 | `azurerm_resource_group.main` | env's `main.tf` |
+| 2 | `azurerm_kubernetes_cluster.this` | `module.aks` |
+| 3 | `helm_release.nginx` | env's `main.tf` (bitnami `oci://registry-1.docker.io/bitnamicharts/nginx`) |
+
+The Azure public IP, Load Balancer, public IP rule, NSG entries on the AKS-managed node-resource-group, and ClusterIP service inside the cluster are **all created by AKS in response to the Service** — they don't appear as separate Terraform resources.
+
+---
+
+## How the providers wire together
+
+The chicken-and-egg between cluster creation and `helm_release` is resolved by Terraform's lazy provider config evaluation. [providers.tf](env/dev/providers.tf):
+
+```hcl
+provider "helm" {
+  kubernetes {
+    host                   = module.aks.host
+    cluster_ca_certificate = base64decode(module.aks.cluster_ca_certificate)
+    client_certificate     = base64decode(module.aks.client_certificate)
+    client_key             = base64decode(module.aks.client_key)
+  }
+}
+```
+
+These references resolve at apply time, after `azurerm_kubernetes_cluster` has been created. The flow on `terraform apply`:
+
+```
+1. azurerm_resource_group.main           ← created first
+2. azurerm_kubernetes_cluster.this       ← takes ~4–6 min
+3. helm provider initializes using AKS module outputs
+4. helm_release.nginx                    ← chart pulled, Service created
+5. AKS asks Azure for a public IP + LB   ← takes ~1–2 min, helm waits with wait=true
+6. apply returns
+```
+
+Cert-based auth (no `kubelogin` dependency on the operator's machine).
+
+---
+
+## How to deploy
+
+### Prerequisites (once)
+
+```bash
+az login
+export ARM_SUBSCRIPTION_ID=<your-sub-id>
+```
+
+The signed-in identity needs:
+- **Contributor** on the subscription (or RG once it exists) — to create the AKS cluster (and the node-resource-group it spawns).
+- **Storage Blob Data Contributor** on `terraformtatesa` — for the remote backend.
+
+### Apply an environment
+
+```bash
+cd env/dev          # or stg, prd
+terraform init      # azurerm + helm providers
+terraform plan      # 3 to add: RG, AKS cluster, helm release
+terraform apply     # ~5–8 min total
+```
+
+### Access the nginx page
+
+```bash
+$(terraform output -raw get_credentials_command)   # writes ~/.kube/config
+
+LB_IP=$(kubectl get svc -n default nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "$LB_IP"
+
+curl http://$LB_IP/                                 # default bitnami nginx welcome page
+# or open http://$LB_IP/ in a browser
+```
+
+If `$LB_IP` is empty, the LB is still provisioning. Watch it:
+
+```bash
+kubectl get svc -n default nginx -w
+# wait for EXTERNAL-IP to flip from <pending> to a real IP, then Ctrl-C
+```
+
+### Tear down
+
+```bash
+terraform destroy
+```
+
+Atomic — single resource group, atomic cleanup of everything including the AKS-managed node RG and the LB / public IP.
+
+---
+
+## Switching environments
+
+`cd` into the folder you want. Each env has its own state file in its own container blob (different `key`):
+
+```bash
+cd env/dev && terraform plan    # touches only aks-dev.tfstate
+cd ../stg  && terraform plan    # touches only aks-stg.tfstate
+cd ../prd  && terraform plan    # touches only aks-prd.tfstate
+```
+
+---
+
+## Why the chart uses an OCI URL
+
+The Bitnami repo at `https://charts.bitnami.com/bitnami` historically served charts over HTTPS index. Bitnami has effectively migrated chart distribution to OCI, and unversioned pulls through the legacy HTTPS index now fail with `could not download chart: invalid_reference: invalid tag` because chart dependencies resolve to OCI references.
+
+The fix in [env/dev/main.tf](env/dev/main.tf) is to pull from OCI directly:
+
+```hcl
+resource "helm_release" "nginx" {
+  name      = "nginx"
+  chart     = "oci://registry-1.docker.io/bitnamicharts/nginx"
+  namespace = "default"
+  ...
+}
+```
+
+Note that `repository` is **not set** when using an OCI reference — the `oci://` prefix is enough for the helm provider to route the pull. If Bitnami ever moves the namespace again (their "secure" tier lives at `bitnamichartssecure/...`), only the chart URL changes.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `helm_release` fails with `invalid_reference: invalid tag` | Pulling Bitnami chart from legacy HTTPS repo | Already addressed: `chart = "oci://registry-1.docker.io/bitnamicharts/nginx"`. If it returns, swap to `bitnamichartssecure`. |
+| `dial tcp: lookup ...: no such host` during helm step on first apply | Helm provider tried to reach the cluster before its API server is reachable from outside | Run `terraform apply` again — second run sees the API responsive. |
+| `EXTERNAL-IP` stuck on `<pending>` for >5 min | Subscription quota for public IPs / LBs in the region exhausted | `az network public-ip list -o table` to see usage; pick a different region in `local.config.location`. |
+| `Forbidden: User cannot list resource ...` in `kubectl` | Default kubeconfig doesn't have the AKS auth context | Re-run `$(terraform output -raw get_credentials_command)` with `--overwrite-existing`. |
+| Pods stuck `Pending` with `0/N nodes available: insufficient cpu` | Bitnami nginx requests > available on a B2s node, especially with `node_count = 1` | Either bump `node_vm_size` (e.g. `Standard_B2ms`) or lower the chart's resource requests via `values`. |
+
+---
+
+## Cost (us-east on-demand, ~730 hr/mo, per env running 24/7)
+
+| Item | dev (1× B2s) | stg (2× B2s) | prd (3× B2s) |
+|------|--------------|--------------|--------------|
+| AKS control plane (Free tier) | $0 | $0 | $0 |
+| Node VMs | ~$30 | ~$60 | ~$90 |
+| OS disks (~30 GB / node) | ~$2 | ~$5 | ~$7 |
+| Standard public IP for LB | ~$3.65 | ~$3.65 | ~$3.65 |
+| Standard Load Balancer (rule + data) | ~$18 | ~$18 | ~$18 |
+| **Total (running 24/7)** | **~$54/mo** | **~$87/mo** | **~$118/mo** |
+
+`az aks stop --name <cluster> -g <rg>` deallocates the nodes (compute drops to ~$0) but keeps the LB + public IP live. Full `terraform destroy` is the cheapest at-rest option.
+
+---
+
+## Deviations from production guidance
+
+- **Single default node pool, no zones.** Production should use multiple node pools (system + user) spread across availability zones. Add a `zones = [1, 2, 3]` argument and create a separate `azurerm_kubernetes_cluster_node_pool` for workloads vs. system services.
+- **No private cluster.** API server is public; anyone with the right cert can hit it. For prod use `private_cluster_enabled = true` + a jumpbox or Azure Bastion, or restrict via `api_server_access_profile.authorized_ip_ranges`.
+- **No autoscaler.** Static `node_count`. Production should enable `enable_auto_scaling = true` with `min_count` / `max_count`.
+- **Default network plugin (kubenet).** Fine for sandbox. Prod should use Azure CNI (overlay) for proper Azure-native pod networking and integration with NSGs / NAT Gateway.
+- **No HTTPS termination.** Service is plain HTTP. Prod should put an Application Gateway / Front Door in front, or run cert-manager + Let's Encrypt on an ingress controller.
+- **No private container registry.** Bitnami chart pulls from public Docker Hub. Prod should mirror to Azure Container Registry and use AKS's ACR-attach for kubelet pull auth.
+- **Open kubeconfig.** The `kube_config_raw` output is sensitive but anyone with state access has it. Lock down state RBAC accordingly.
+- **Cluster admin RBAC, no AAD integration.** Cert-based admin auth is enabled by default on AKS. Production should use `azure_active_directory_role_based_access_control` and disable local cert-based admin (`local_account_disabled = true`).
+- **No backups.** etcd is managed but no scheduled backups of cluster state or PVs. For prod, enable Azure Backup for AKS.
